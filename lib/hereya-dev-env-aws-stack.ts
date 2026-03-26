@@ -72,6 +72,12 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       // Install AWS CDK globally
       'npm install -g aws-cdk',
 
+      // Install Docker
+      'dnf install -y docker',
+      'systemctl enable docker',
+      'systemctl start docker',
+      'usermod -aG docker ec2-user',
+
       // Install cloudflared for tunneling
       'curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm -o /tmp/cloudflared.rpm',
       'dnf install -y /tmp/cloudflared.rpm',
