@@ -71,6 +71,11 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
 
       // Install AWS CDK globally
       'npm install -g aws-cdk',
+
+      // Install cloudflared for tunneling
+      'curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm -o /tmp/cloudflared.rpm',
+      'dnf install -y /tmp/cloudflared.rpm',
+      'rm -f /tmp/cloudflared.rpm',
     );
 
     // Login to Hereya Cloud if token provided
