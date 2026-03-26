@@ -34,78 +34,159 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       'SSH access',
     );
 
-    // IAM role with SSM for Session Manager fallback
+    // IAM role with SSM for Session Manager fallback + CloudFormation signal
     const role = new iam.Role(this, 'DevEnvRole', {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
       ],
     });
+    // Allow instance to describe its own stack and signal CloudFormation
+    role.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'cloudformation:DescribeStackResource',
+        'cloudformation:SignalResource',
+      ],
+      resources: ['*'],
+    }));
 
     // EC2 Key Pair — private key auto-stored in SSM Parameter Store at /ec2/keypair/{keyPairId}
     const keyPair = new ec2.KeyPair(this, 'DevEnvKeyPair', {
       keyPairName: `${this.stackName}-dev-env-key`,
     });
 
-    // UserData script
-    const userData = ec2.UserData.forLinux();
-    userData.addCommands(
+    // Build the setup script content
+    const setupLines = [
+      '#!/bin/bash',
       'set -ex',
-
-      // Log all output for debugging
-      'exec > >(tee /var/log/hereya-dev-env-userdata.log) 2>&1',
-
-      // System updates and git
+      'exec > >(tee /var/log/hereya-dev-env-setup.log) 2>&1',
+      '',
+      '# System updates and git',
       'dnf update -y',
       'dnf install -y git',
-
-      // Install Node.js 22 via NodeSource
+      '',
+      '# Install Node.js 22 via NodeSource',
       'curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -',
       'dnf install -y nodejs',
-
-      // Install Claude Code globally
+      '',
+      '# Install Claude Code globally',
       'npm install -g @anthropic-ai/claude-code',
-
-      // Install Hereya CLI globally
+      '',
+      '# Install Hereya CLI globally',
       'npm install -g hereya-cli',
-
-      // Install AWS CDK globally
+      '',
+      '# Install AWS CDK globally',
       'npm install -g aws-cdk',
-
-      // Install Docker
+      '',
+      '# Install Docker',
       'dnf install -y docker',
       'systemctl enable docker',
       'systemctl start docker',
       'usermod -aG docker ec2-user',
-
-      // Install cloudflared for tunneling
+      '',
+      '# Install cloudflared for tunneling',
       'curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm -o /tmp/cloudflared.rpm',
       'dnf install -y /tmp/cloudflared.rpm',
       'rm -f /tmp/cloudflared.rpm',
-    );
+    ];
 
     // Login to Hereya Cloud if token provided
     if (hereyaToken) {
-      userData.addCommands(
+      setupLines.push(
+        '',
+        '# Login to Hereya Cloud',
         `sudo -u ec2-user hereya login --token=${hereyaToken} ${hereyaCloudUrl}`,
       );
     }
 
-    userData.addCommands(
-      // Verify installations
+    setupLines.push(
+      '',
+      '# Verify installations',
       'node --version',
       'npm --version',
       'claude --version || true',
       'hereya --version || true',
       'cdk --version',
-
-      // Make global npm packages available to ec2-user
-      'echo \'export PATH=/usr/lib/node_modules/.bin:$PATH\' >> /home/ec2-user/.bashrc',
+      '',
+      '# Make global npm packages available to ec2-user',
+      "grep -q '/usr/lib/node_modules/.bin' /home/ec2-user/.bashrc || echo 'export PATH=/usr/lib/node_modules/.bin:$PATH' >> /home/ec2-user/.bashrc",
     );
+
+    const setupScript = setupLines.join('\n');
+
+    // CloudFormation::Init configuration
+    const cfnInit = ec2.CloudFormationInit.fromConfigSets({
+      configSets: {
+        default: ['setup', 'cfnHup'],
+      },
+      configs: {
+        // Main setup: write and execute the provisioning script
+        setup: new ec2.InitConfig([
+          ec2.InitFile.fromString('/opt/hereya/setup.sh', setupScript, {
+            mode: '000755',
+            owner: 'root',
+            group: 'root',
+          }),
+          ec2.InitCommand.shellCommand('/opt/hereya/setup.sh', {
+            key: '01-run-setup',
+          }),
+        ]),
+        // cfn-hup: daemon that watches for metadata changes and re-runs init
+        cfnHup: new ec2.InitConfig([
+          // Systemd unit for cfn-hup (not shipped by default on AL2023)
+          ec2.InitFile.fromString('/etc/systemd/system/cfn-hup.service', [
+            '[Unit]',
+            'Description=cfn-hup daemon',
+            '',
+            '[Service]',
+            'Type=simple',
+            'ExecStart=/opt/aws/bin/cfn-hup -v',
+            'Restart=always',
+            '',
+            '[Install]',
+            'WantedBy=multi-user.target',
+          ].join('\n'), {
+            mode: '000644',
+            owner: 'root',
+            group: 'root',
+          }),
+          ec2.InitCommand.shellCommand('systemctl daemon-reload', {
+            key: '00-reload-systemd',
+          }),
+          ec2.InitFile.fromString('/etc/cfn/cfn-hup.conf', [
+            '[main]',
+            `stack=${this.stackId}`,
+            `region=${this.region}`,
+            'interval=2',
+            'verbose=true',
+          ].join('\n'), {
+            mode: '000400',
+            owner: 'root',
+            group: 'root',
+          }),
+          ec2.InitFile.fromString('/etc/cfn/hooks.d/cfn-auto-reloader.conf', [
+            '[cfn-auto-reloader-hook]',
+            'triggers=post.update',
+            'path=Resources.DevEnvInstance.Metadata.AWS::CloudFormation::Init',
+            `action=/opt/aws/bin/cfn-init -v --stack ${this.stackId} --resource DevEnvInstance --configsets default --region ${this.region}`,
+            'runas=root',
+          ].join('\n'), {
+            mode: '000400',
+            owner: 'root',
+            group: 'root',
+          }),
+          ec2.InitService.enable('cfn-hup', {
+            enabled: true,
+            ensureRunning: true,
+            serviceRestartHandle: new ec2.InitServiceRestartHandle(),
+          }),
+        ]),
+      },
+    });
 
     const [instClass, instSize] = instanceType.split('.');
 
-    // Single EC2 instance
+    // Single EC2 instance with CloudFormation::Init
     const instance = new ec2.Instance(this, 'DevEnvInstance', {
       vpc,
       instanceType: ec2.InstanceType.of(
@@ -115,7 +196,6 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       machineImage: ec2.MachineImage.latestAmazonLinux2023(),
       securityGroup: sg,
       role,
-      userData,
       keyPair,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       associatePublicIpAddress: true,
@@ -127,6 +207,11 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
           }),
         },
       ],
+      init: cfnInit,
+      initOptions: {
+        configSets: ['default'],
+        timeout: cdk.Duration.minutes(30),
+      },
     });
 
     // Optional Route53 DNS record: <stackName>.<domain>
