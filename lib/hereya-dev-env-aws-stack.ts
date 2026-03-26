@@ -14,6 +14,8 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
     const sshCidr = process.env['sshCidr'] || '0.0.0.0/0';
     const volumeSizeGb = parseInt(process.env['volumeSize'] || '50', 10);
     const domain: string | undefined = process.env['domain'];
+    const hereyaToken: string | undefined = process.env['hereyaToken'];
+    const hereyaCloudUrl: string = process.env['hereyaCloudUrl'] || 'https://cloud.hereya.dev';
 
     // VPC
     const vpc = vpcId
@@ -69,7 +71,16 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
 
       // Install AWS CDK globally
       'npm install -g aws-cdk',
+    );
 
+    // Login to Hereya Cloud if token provided
+    if (hereyaToken) {
+      userData.addCommands(
+        `sudo -u ec2-user hereya login --token=${hereyaToken} ${hereyaCloudUrl}`,
+      );
+    }
+
+    userData.addCommands(
       // Verify installations
       'node --version',
       'npm --version',
