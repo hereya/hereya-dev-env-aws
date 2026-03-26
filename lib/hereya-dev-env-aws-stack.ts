@@ -116,41 +116,39 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
         target: route53.RecordTarget.fromIpAddresses(instance.instancePublicIp),
       });
 
-      new cdk.CfnOutput(this, 'sshHostDns', {
+      new cdk.CfnOutput(this, 'devEnvSshHostDns', {
         value: `${this.stackName}.${domain}`,
         description: 'DNS name of the dev environment instance',
       });
     }
 
     // Outputs
-    new cdk.CfnOutput(this, 'sshHost', {
+    new cdk.CfnOutput(this, 'devEnvSshHost', {
       value: instance.instancePublicIp,
       description: 'Public IP of the dev environment instance',
     });
 
-    // The KeyPair L2 construct stores private key in SSM at /ec2/keypair/{keyPairId}
-    // Outputting the SSM ARN so Hereya auto-resolves it to the actual PEM key as a secret
-    new cdk.CfnOutput(this, 'sshPrivateKey', {
+    new cdk.CfnOutput(this, 'devEnvSshPrivateKey', {
       value: `arn:aws:ssm:${this.region}:${this.account}:parameter/ec2/keypair/${keyPair.keyPairId}`,
       description: 'SSM Parameter ARN for the SSH private key (auto-resolved by Hereya)',
     });
 
-    new cdk.CfnOutput(this, 'sshUser', {
+    new cdk.CfnOutput(this, 'devEnvSshUser', {
       value: 'ec2-user',
       description: 'SSH username',
     });
 
-    new cdk.CfnOutput(this, 'sshKeyPairId', {
+    new cdk.CfnOutput(this, 'devEnvSshKeyPairId', {
       value: keyPair.keyPairId,
       description: 'EC2 Key Pair ID',
     });
 
-    new cdk.CfnOutput(this, 'securityGroupId', {
+    new cdk.CfnOutput(this, 'devEnvSecurityGroupId', {
       value: sg.securityGroupId,
       description: 'Security group ID',
     });
 
-    new cdk.CfnOutput(this, 'instanceId', {
+    new cdk.CfnOutput(this, 'devEnvInstanceId', {
       value: instance.instanceId,
       description: 'EC2 Instance ID',
     });
