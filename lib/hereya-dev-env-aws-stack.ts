@@ -152,7 +152,7 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
     new logs.LogGroup(this, 'DevEnvLogGroup', {
       logGroupName: `/hereya/dev-env/${this.stackName}`,
       retention: logs.RetentionDays.ONE_WEEK,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
     // CloudFormation::Init configuration
