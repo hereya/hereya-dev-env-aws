@@ -181,6 +181,7 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
           ec2.InitService.enable('cfn-hup', {
             enabled: true,
             ensureRunning: true,
+            serviceManager: ec2.ServiceManager.SYSTEMD,
             serviceRestartHandle: new ec2.InitServiceRestartHandle(),
           }),
         ]),
