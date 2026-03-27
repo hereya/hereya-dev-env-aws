@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import { Construct } from 'constructs';
 
@@ -46,6 +47,17 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       actions: [
         'cloudformation:DescribeStackResource',
         'cloudformation:SignalResource',
+      ],
+      resources: ['*'],
+    }));
+
+    // Allow instance to push logs to CloudWatch
+    role.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'logs:CreateLogGroup',
+        'logs:CreateLogStream',
+        'logs:PutLogEvents',
+        'logs:DescribeLogStreams',
       ],
       resources: ['*'],
     }));
@@ -117,12 +129,53 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
 
     const setupScript = setupLines.join('\n');
 
+    // CloudWatch agent config to stream setup logs
+    const cwAgentConfig = {
+      logs: {
+        logs_collected: {
+          files: {
+            collect_list: [
+              {
+                file_path: '/var/log/cfn-init.log',
+                log_group_name: `/hereya/dev-env/${this.stackName}`,
+                log_stream_name: 'cfn-init',
+              },
+              {
+                file_path: '/var/log/hereya-dev-env-setup.log',
+                log_group_name: `/hereya/dev-env/${this.stackName}`,
+                log_stream_name: 'setup',
+              },
+            ],
+          },
+        },
+      },
+    };
+
+    // Log group with auto-cleanup
+    new logs.LogGroup(this, 'DevEnvLogGroup', {
+      logGroupName: `/hereya/dev-env/${this.stackName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     // CloudFormation::Init configuration
     const cfnInit = ec2.CloudFormationInit.fromConfigSets({
       configSets: {
-        default: ['setup', 'cfnHup'],
+        default: ['cloudwatch', 'setup'],
       },
       configs: {
+        // CloudWatch agent: install and start before setup so logs are captured
+        cloudwatch: new ec2.InitConfig([
+          ec2.InitPackage.yum('amazon-cloudwatch-agent'),
+          ec2.InitFile.fromString(
+            '/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json',
+            JSON.stringify(cwAgentConfig, null, 2),
+          ),
+          ec2.InitCommand.shellCommand(
+            '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json',
+            { key: '01-start-cw-agent' },
+          ),
+        ]),
         // Main setup: write and execute the provisioning script
         setup: new ec2.InitConfig([
           ec2.InitFile.fromString('/opt/hereya/setup.sh', setupScript, {
@@ -132,57 +185,6 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
           }),
           ec2.InitCommand.shellCommand('/opt/hereya/setup.sh', {
             key: '01-run-setup',
-          }),
-        ]),
-        // cfn-hup: daemon that watches for metadata changes and re-runs init
-        cfnHup: new ec2.InitConfig([
-          // Systemd unit for cfn-hup (not shipped by default on AL2023)
-          ec2.InitFile.fromString('/etc/systemd/system/cfn-hup.service', [
-            '[Unit]',
-            'Description=cfn-hup daemon',
-            '',
-            '[Service]',
-            'Type=simple',
-            'ExecStart=/opt/aws/bin/cfn-hup -v',
-            'Restart=always',
-            '',
-            '[Install]',
-            'WantedBy=multi-user.target',
-          ].join('\n'), {
-            mode: '000644',
-            owner: 'root',
-            group: 'root',
-          }),
-          ec2.InitCommand.shellCommand('systemctl daemon-reload', {
-            key: '00-reload-systemd',
-          }),
-          ec2.InitFile.fromString('/etc/cfn/cfn-hup.conf', [
-            '[main]',
-            `stack=${this.stackId}`,
-            `region=${this.region}`,
-            'interval=2',
-            'verbose=true',
-          ].join('\n'), {
-            mode: '000400',
-            owner: 'root',
-            group: 'root',
-          }),
-          ec2.InitFile.fromString('/etc/cfn/hooks.d/cfn-auto-reloader.conf', [
-            '[cfn-auto-reloader-hook]',
-            'triggers=post.update',
-            'path=Resources.DevEnvInstance.Metadata.AWS::CloudFormation::Init',
-            `action=/opt/aws/bin/cfn-init -v --stack ${this.stackId} --resource DevEnvInstance --configsets default --region ${this.region}`,
-            'runas=root',
-          ].join('\n'), {
-            mode: '000400',
-            owner: 'root',
-            group: 'root',
-          }),
-          ec2.InitService.enable('cfn-hup', {
-            enabled: true,
-            ensureRunning: true,
-            serviceManager: ec2.ServiceManager.SYSTEMD,
-            serviceRestartHandle: new ec2.InitServiceRestartHandle(),
           }),
         ]),
       },
