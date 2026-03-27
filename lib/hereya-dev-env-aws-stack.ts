@@ -110,6 +110,9 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       '',
       '# Make global npm packages available to ec2-user',
       "grep -q '/usr/lib/node_modules/.bin' /home/ec2-user/.bashrc || echo 'export PATH=/usr/lib/node_modules/.bin:$PATH' >> /home/ec2-user/.bashrc",
+      '',
+      '# Hourly cron to auto-update hereya CLI',
+      'echo "7 * * * * npm install -g hereya-cli@latest 2>/dev/null" | crontab -',
     );
 
     const setupScript = setupLines.join('\n');
