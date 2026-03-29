@@ -124,6 +124,45 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       "grep -q '/usr/lib/node_modules/.bin' /home/ec2-user/.bashrc || echo 'export PATH=/usr/lib/node_modules/.bin:$PATH' >> /home/ec2-user/.bashrc",
     );
 
+    // Hereya CLI auto-update: hourly cron
+    setupLines.push(
+      '',
+      '# Hereya CLI auto-update cron',
+      "cat > /opt/hereya/update-hereya.sh << 'UPDATEEOF'",
+      '#!/bin/bash',
+      'exec 200>/var/lock/hereya-update.lock',
+      'flock -n 200 || exit 0',
+      'LOG_TAG="hereya-update"',
+      'log() {',
+      '  echo "$(date \'+%Y-%m-%d %H:%M:%S\') $1" | tee -a /var/log/hereya-update.log',
+      '  logger -t "$LOG_TAG" "$1"',
+      '}',
+      "CURRENT=$(hereya --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' || echo '0.0.0')",
+      "LATEST=$(npm view hereya-cli version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+')",
+      'if [ -z "$LATEST" ]; then',
+      '  log "ERROR: Failed to fetch latest version from npm"',
+      '  exit 1',
+      'fi',
+      'if [ "$CURRENT" = "$LATEST" ]; then',
+      '  log "hereya-cli is up to date ($CURRENT)"',
+      '  exit 0',
+      'fi',
+      'log "Updating hereya-cli from $CURRENT to $LATEST"',
+      'if npm install -g hereya-cli@latest 2>&1 | tee -a /var/log/hereya-update.log; then',
+      "  INSTALLED=$(hereya --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+')",
+      '  log "Update successful: now running $INSTALLED"',
+      'else',
+      '  log "ERROR: npm install failed"',
+      '  exit 1',
+      'fi',
+      'UPDATEEOF',
+      'chmod +x /opt/hereya/update-hereya.sh',
+      '',
+      '# Schedule hourly update check at minute 17',
+      'echo "17 * * * * root /opt/hereya/update-hereya.sh" > /etc/cron.d/hereya-update',
+      'chmod 644 /etc/cron.d/hereya-update',
+    );
+
     const setupScript = setupLines.join('\n');
 
     // CloudWatch agent config to stream setup logs
@@ -141,6 +180,11 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
                 file_path: '/var/log/hereya-dev-env-setup.log',
                 log_group_name: `/hereya/dev-env/${this.stackName}`,
                 log_stream_name: 'setup',
+              },
+              {
+                file_path: '/var/log/hereya-update.log',
+                log_group_name: `/hereya/dev-env/${this.stackName}`,
+                log_stream_name: 'hereya-update',
               },
             ],
           },
