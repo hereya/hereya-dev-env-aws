@@ -75,7 +75,7 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       '',
       '# System updates and git',
       'dnf update -y',
-      'dnf install -y git',
+      'dnf install -y git cronie',
       '',
       '# Install Node.js 22 via NodeSource',
       'curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -',
