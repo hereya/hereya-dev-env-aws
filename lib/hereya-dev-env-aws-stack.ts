@@ -361,6 +361,11 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       },
     });
 
+    // Tag the instance so IAM policies can scope by tag instead of by instance ID
+    // (referencing instance.instanceId in resource ARNs creates a circular dep
+    // between the instance, its role, and the role's policy).
+    cdk.Tags.of(instance).add('hereya:devenv-stack', this.stackName);
+
     // IAM additions for the instance role when idle stop is enabled
     if (idleStopMinutes > 0) {
       role.addToPolicy(new iam.PolicyStatement({
@@ -372,9 +377,10 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       }));
       role.addToPolicy(new iam.PolicyStatement({
         actions: ['ec2:StopInstances'],
-        resources: [
-          `arn:aws:ec2:${this.region}:${this.account}:instance/${instance.instanceId}`,
-        ],
+        resources: [`arn:aws:ec2:${this.region}:${this.account}:instance/*`],
+        conditions: {
+          StringEquals: { 'ec2:ResourceTag/hereya:devenv-stack': this.stackName },
+        },
       }));
     }
 
@@ -490,12 +496,14 @@ exports.handler = async (event) => {
 `),
       });
 
-      // IAM for broker
+      // IAM for broker — scope by tag, not by instance ARN, to avoid the same
+      // circular dep that bit the instance role.
       brokerFn.addToRolePolicy(new iam.PolicyStatement({
         actions: ['ec2:StartInstances', 'ec2:StopInstances'],
-        resources: [
-          `arn:aws:ec2:${this.region}:${this.account}:instance/${instance.instanceId}`,
-        ],
+        resources: [`arn:aws:ec2:${this.region}:${this.account}:instance/*`],
+        conditions: {
+          StringEquals: { 'ec2:ResourceTag/hereya:devenv-stack': this.stackName },
+        },
       }));
       brokerFn.addToRolePolicy(new iam.PolicyStatement({
         actions: ['ec2:DescribeInstances'],
@@ -545,9 +553,10 @@ exports.handler = async (event) => {
         policy: cr.AwsCustomResourcePolicy.fromStatements([
           new iam.PolicyStatement({
             actions: ['ec2:StopInstances'],
-            resources: [
-              `arn:aws:ec2:${this.region}:${this.account}:instance/${instance.instanceId}`,
-            ],
+            resources: [`arn:aws:ec2:${this.region}:${this.account}:instance/*`],
+            conditions: {
+              StringEquals: { 'ec2:ResourceTag/hereya:devenv-stack': this.stackName },
+            },
           }),
         ]),
       });
