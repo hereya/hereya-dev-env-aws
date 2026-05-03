@@ -1,8 +1,13 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
+import { HttpLambdaAuthorizer, HttpLambdaResponseType } from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
+import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
+import * as cr from 'aws-cdk-lib/custom-resources';
 import { Construct } from 'constructs';
 
 export class HereyaDevEnvAwsStack extends cdk.Stack {
@@ -14,9 +19,13 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
     const vpcId: string | undefined = process.env['vpcId'];
     const sshCidr = process.env['sshCidr'] || '0.0.0.0/0';
     const volumeSizeGb = parseInt(process.env['volumeSize'] || '50', 10);
-    const domain: string | undefined = process.env['domain'];
     const hereyaToken: string | undefined = process.env['hereyaToken'];
     const hereyaCloudUrl: string = process.env['hereyaCloudUrl'] || 'https://cloud.hereya.dev';
+
+    // New parameters for on-demand lifecycle and idle stop
+    const lifecycle = process.env['lifecycle'] || 'on-demand';
+    const idleStopMinutes = parseInt(process.env['idleStopMinutes'] || '30', 10);
+    const connectionIdleBps = parseInt(process.env['connectionIdleBps'] || '100', 10);
 
     // VPC
     const vpc = vpcId
@@ -163,6 +172,97 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       'chmod 644 /etc/cron.d/hereya-update',
     );
 
+    // Idle activity tracker — only when idleStopMinutes > 0
+    if (idleStopMinutes > 0) {
+      setupLines.push(
+        '',
+        '# Idle activity tracker — per-:22-connection byte rate',
+        'mkdir -p /var/lib/hereya',
+        "cat > /opt/hereya/check-activity.sh <<'CHKEOF'",
+        '#!/bin/bash',
+        'set -u',
+        `IDLE_BPS=${connectionIdleBps}`,
+        `IDLE_LIMIT=${idleStopMinutes}`,
+        'STATE=/var/lib/hereya/conn-state.tsv',
+        'STREAK=/var/lib/hereya/idle-streak',
+        '',
+        'IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || echo "")',
+        '[ -z "$IMDS_TOKEN" ] && exit 0',
+        'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)',
+        'REGION=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/region)',
+        'NOW=$(date +%s)',
+        '',
+        '# Build a temp state file. ss -tinH outputs one connection per pair of lines (header line + TCP_INFO line)',
+        'TMP=$(mktemp)',
+        'ACTIVE=0',
+        "ss -tinH state established '( sport = :22 )' 2>/dev/null | awk -v now=$NOW '",
+        '  /^[A-Z]/ {',
+        '    # Connection summary line — last whitespace-separated field is peer',
+        '    peer=$NF;',
+        '    next',
+        '  }',
+        '  /bytes_sent/ {',
+        '    snt=0; rcv=0',
+        '    for (i=1; i<=NF; i++) {',
+        '      if (match($i, /^bytes_sent:([0-9]+)/, a)) snt=a[1]',
+        '      if (match($i, /^bytes_received:([0-9]+)/, b)) rcv=b[1]',
+        '    }',
+        '    print peer "\\t" snt "\\t" rcv "\\t" now',
+        '  }',
+        "' > \"$TMP\"",
+        '',
+        '# For each connection in TMP, look up prior in STATE and compute rate',
+        'while IFS=$\'\\t\' read -r peer snt rcv ts; do',
+        '  prev=$(grep -F "${peer}\t" "$STATE" 2>/dev/null | tail -1)',
+        '  if [ -n "$prev" ]; then',
+        '    psnt=$(echo "$prev" | cut -f2)',
+        '    prcv=$(echo "$prev" | cut -f3)',
+        '    pts=$(echo "$prev" | cut -f4)',
+        '    elapsed=$((ts - pts))',
+        '    [ "$elapsed" -lt 1 ] && elapsed=1',
+        '    delta=$(( (snt - psnt) + (rcv - prcv) ))',
+        '    rate=$(( delta / elapsed ))',
+        '    if [ "$rate" -ge "$IDLE_BPS" ]; then',
+        '      ACTIVE=$((ACTIVE + 1))',
+        '    fi',
+        '  else',
+        '    # First sighting — give it the benefit of the doubt',
+        '    ACTIVE=$((ACTIVE + 1))',
+        '  fi',
+        'done < "$TMP"',
+        '',
+        '# Replace state atomically',
+        'mv "$TMP" "$STATE"',
+        '',
+        '# Publish metric (best-effort)',
+        'aws cloudwatch put-metric-data \\',
+        '  --namespace HereyaDevEnv \\',
+        '  --metric-name ActiveSshConnections \\',
+        '  --value "$ACTIVE" \\',
+        '  --dimensions InstanceId="$INSTANCE_ID" \\',
+        '  --region "$REGION" >/dev/null 2>&1 || true',
+        '',
+        '# Self-stop logic',
+        'if [ "$ACTIVE" -eq 0 ]; then',
+        '  CUR=$(cat "$STREAK" 2>/dev/null || echo 0)',
+        '  CUR=$((CUR + 1))',
+        '  echo "$CUR" > "$STREAK"',
+        '  if [ "$CUR" -ge "$IDLE_LIMIT" ]; then',
+        '    logger -t hereya-idle "Idle for $CUR consecutive minutes; stopping instance"',
+        '    aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null 2>&1 || true',
+        '  fi',
+        'else',
+        '  echo 0 > "$STREAK"',
+        'fi',
+        'CHKEOF',
+        'chmod +x /opt/hereya/check-activity.sh',
+        '',
+        '# Cron entry',
+        'echo "* * * * * root /opt/hereya/check-activity.sh" > /etc/cron.d/hereya-activity',
+        'chmod 644 /etc/cron.d/hereya-activity',
+      );
+    }
+
     const setupScript = setupLines.join('\n');
 
     // CloudWatch agent config to stream setup logs
@@ -261,18 +361,205 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       },
     });
 
-    // Optional Route53 DNS record: <stackName>.<domain>
-    if (domain) {
-      const zone = route53.HostedZone.fromLookup(this, 'Zone', { domainName: domain });
-      new route53.ARecord(this, 'DevEnvDns', {
-        zone,
-        recordName: `${this.stackName}.${domain}`,
-        target: route53.RecordTarget.fromIpAddresses(instance.instancePublicIp),
+    // IAM additions for the instance role when idle stop is enabled
+    if (idleStopMinutes > 0) {
+      role.addToPolicy(new iam.PolicyStatement({
+        actions: ['cloudwatch:PutMetricData'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'cloudwatch:namespace': 'HereyaDevEnv' },
+        },
+      }));
+      role.addToPolicy(new iam.PolicyStatement({
+        actions: ['ec2:StopInstances'],
+        resources: [
+          `arn:aws:ec2:${this.region}:${this.account}:instance/${instance.instanceId}`,
+        ],
+      }));
+    }
+
+    // On-demand wake broker (Lambda + API Gateway + Authorizer + Token Secret)
+    if (lifecycle === 'on-demand') {
+      // Token secret
+      const tokenSecret = new secretsmanager.Secret(this, 'DevEnvWakeToken', {
+        secretName: `/hereya/devenv/${this.stackName}/wake-token`,
+        generateSecretString: {
+          excludePunctuation: true,
+          passwordLength: 48,
+        },
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
 
-      new cdk.CfnOutput(this, 'devEnvSshHostDns', {
-        value: `${this.stackName}.${domain}`,
-        description: 'DNS name of the dev environment instance',
+      // Authorizer Lambda
+      const authorizerFn = new lambda.Function(this, 'DevEnvAuthorizerFn', {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        handler: 'index.handler',
+        timeout: cdk.Duration.seconds(10),
+        environment: {
+          TOKEN_SECRET_ARN: tokenSecret.secretArn,
+        },
+        code: lambda.Code.fromInline(`
+let cachedToken;
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+const sm = new SecretsManagerClient({});
+const { timingSafeEqual } = require('crypto');
+
+exports.handler = async (event) => {
+  try {
+    if (!cachedToken) {
+      const r = await sm.send(new GetSecretValueCommand({ SecretId: process.env.TOKEN_SECRET_ARN }));
+      cachedToken = r.SecretString;
+    }
+    const headers = event.headers || {};
+    const authHeader = headers.authorization || headers.Authorization || '';
+    const m = /^Bearer\\s+(.+)$/.exec(authHeader);
+    if (!m) return { isAuthorized: false };
+    const supplied = Buffer.from(m[1]);
+    const expected = Buffer.from(cachedToken);
+    if (supplied.length !== expected.length) return { isAuthorized: false };
+    return { isAuthorized: timingSafeEqual(supplied, expected) };
+  } catch (e) {
+    console.error('authorizer error', e);
+    return { isAuthorized: false };
+  }
+};
+`),
+      });
+      tokenSecret.grantRead(authorizerFn);
+
+      // Broker Lambda
+      const brokerEnv: { [k: string]: string } = {
+        INSTANCE_ID: instance.instanceId,
+        REGION: this.region,
+      };
+
+      const brokerFn = new lambda.Function(this, 'DevEnvBrokerFn', {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        handler: 'index.handler',
+        timeout: cdk.Duration.seconds(15),
+        environment: brokerEnv,
+        code: lambda.Code.fromInline(`
+const { EC2Client, DescribeInstancesCommand, StartInstancesCommand, StopInstancesCommand } = require('@aws-sdk/client-ec2');
+
+const ec2 = new EC2Client({ region: process.env.REGION });
+
+async function describe() {
+  const r = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }));
+  const inst = r.Reservations && r.Reservations[0] && r.Reservations[0].Instances && r.Reservations[0].Instances[0];
+  if (!inst) return { state: 'unknown', host: '', lastTransitionAt: new Date().toISOString() };
+  const state = inst.State && inst.State.Name || 'unknown';
+  const host = inst.PublicIpAddress || '';
+  const lastTransitionAt = inst.StateTransitionReason || new Date().toISOString();
+  return { state, host, lastTransitionAt };
+}
+
+function reply(statusCode, body) {
+  return {
+    statusCode,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+}
+
+exports.handler = async (event) => {
+  const method = (event.requestContext && event.requestContext.http && event.requestContext.http.method) || event.httpMethod || '';
+  const path = (event.requestContext && event.requestContext.http && event.requestContext.http.path) || event.rawPath || event.path || '';
+  try {
+    if (method === 'POST' && path.endsWith('/wake')) {
+      const desc = await describe();
+      if (desc.state === 'stopped' || desc.state === 'stopping') {
+        await ec2.send(new StartInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }));
+        return reply(200, { state: 'pending', host: '' });
+      }
+      return reply(200, { state: desc.state, host: desc.host });
+    }
+    if (method === 'POST' && path.endsWith('/sleep')) {
+      await ec2.send(new StopInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }));
+      return reply(200, { state: 'stopping' });
+    }
+    if (method === 'GET' && path.endsWith('/status')) {
+      const desc = await describe();
+      return reply(200, desc);
+    }
+    return reply(404, { error: 'not_found' });
+  } catch (e) {
+    console.error('broker error', e);
+    return reply(500, { error: 'internal_error', message: String(e && e.message || e) });
+  }
+};
+`),
+      });
+
+      // IAM for broker
+      brokerFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['ec2:StartInstances', 'ec2:StopInstances'],
+        resources: [
+          `arn:aws:ec2:${this.region}:${this.account}:instance/${instance.instanceId}`,
+        ],
+      }));
+      brokerFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['ec2:DescribeInstances'],
+        resources: ['*'],
+      }));
+
+      // HTTP API + authorizer
+      const httpApi = new apigwv2.HttpApi(this, 'DevEnvHttpApi', {
+        apiName: `${this.stackName}-dev-env-wake`,
+      });
+
+      const authorizer = new HttpLambdaAuthorizer('DevEnvAuthorizer', authorizerFn, {
+        responseTypes: [HttpLambdaResponseType.SIMPLE],
+      });
+
+      const brokerIntegration = new HttpLambdaIntegration('DevEnvBrokerIntegration', brokerFn);
+
+      httpApi.addRoutes({
+        path: '/wake',
+        methods: [apigwv2.HttpMethod.POST],
+        integration: brokerIntegration,
+        authorizer,
+      });
+      httpApi.addRoutes({
+        path: '/sleep',
+        methods: [apigwv2.HttpMethod.POST],
+        integration: brokerIntegration,
+        authorizer,
+      });
+      httpApi.addRoutes({
+        path: '/status',
+        methods: [apigwv2.HttpMethod.GET],
+        integration: brokerIntegration,
+        authorizer,
+      });
+
+      // Initial-stop custom resource — fires only on create
+      const initialStop = new cr.AwsCustomResource(this, 'DevEnvInitialStop', {
+        onCreate: {
+          service: 'EC2',
+          action: 'stopInstances',
+          parameters: {
+            InstanceIds: [instance.instanceId],
+          },
+          physicalResourceId: cr.PhysicalResourceId.of(`${this.stackName}-initial-stop`),
+        },
+        policy: cr.AwsCustomResourcePolicy.fromStatements([
+          new iam.PolicyStatement({
+            actions: ['ec2:StopInstances'],
+            resources: [
+              `arn:aws:ec2:${this.region}:${this.account}:instance/${instance.instanceId}`,
+            ],
+          }),
+        ]),
+      });
+      initialStop.node.addDependency(instance);
+
+      new cdk.CfnOutput(this, 'devEnvWakeUrl', {
+        value: httpApi.apiEndpoint,
+        description: 'HTTP API endpoint for the on-demand wake broker',
+      });
+      new cdk.CfnOutput(this, 'devEnvWakeToken', {
+        value: tokenSecret.secretArn,
+        description: 'Secrets Manager ARN for the wake bearer token (resolved by Hereya CLI)',
       });
     }
 
@@ -305,6 +592,20 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'devEnvInstanceId', {
       value: instance.instanceId,
       description: 'EC2 Instance ID',
+    });
+
+    // Informational outputs (always emitted)
+    new cdk.CfnOutput(this, 'devEnvLifecycle', {
+      value: lifecycle,
+      description: 'Lifecycle mode (always-on or on-demand)',
+    });
+    new cdk.CfnOutput(this, 'devEnvIdleStopMinutes', {
+      value: String(idleStopMinutes),
+      description: 'Consecutive idle minutes before self-stop (0 disables)',
+    });
+    new cdk.CfnOutput(this, 'devEnvConnectionIdleBps', {
+      value: String(connectionIdleBps),
+      description: 'Per-connection bytes/sec threshold for idle detection',
     });
   }
 }

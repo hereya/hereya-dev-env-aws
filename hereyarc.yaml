@@ -1,5 +1,5 @@
 name: hereya/dev-env-aws
-version: 0.8.1
+version: 0.9.0
 description: "Remote dev environment on AWS EC2 with Claude Code, Node.js 22, and Hereya CLI"
 visibility: public
 iac: cdk
