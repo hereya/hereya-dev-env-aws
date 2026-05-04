@@ -1,6 +1,6 @@
 {
   "name": "hereya-dev-env-aws",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "bin": {
     "hereya-dev-env-aws": "bin/hereya-dev-env-aws.js"
   },
