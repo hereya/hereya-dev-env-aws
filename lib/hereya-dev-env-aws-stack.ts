@@ -407,9 +407,17 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
 
     // On-demand wake broker (Lambda + API Gateway + Authorizer)
     if (lifecycle === 'on-demand') {
-      if (!ownerUserId) {
-        throw new Error('ownerUserId is required when lifecycle=on-demand');
-      }
+      // ownerUserId is required at first install (the CLI's `devenv install`
+      // always passes it, derived from the issued PersonalToken). But `cdk
+      // destroy` runs synth first and the destroy flow doesn't supply
+      // install-time params — so we'd otherwise throw here and block every
+      // uninstall. Fall back to a placeholder during synth-without-deploy:
+      // the OWNER_USER_ID env var on the deployed Lambda is whatever was set
+      // at the last successful deploy; an unmatched placeholder synth result
+      // doesn't reach AWS (cdk destroy issues DeleteStack against the
+      // existing CFN stack regardless).
+      const effectiveOwnerUserId =
+        ownerUserId ?? '__unset_during_destroy_or_lookup__';
 
       // Authorizer Lambda — verifies the caller's hereya-cloud access token
       // against the verify-token endpoint and gates by recorded owner userId.
@@ -418,7 +426,7 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
         handler: 'index.handler',
         timeout: cdk.Duration.seconds(10),
         environment: {
-          OWNER_USER_ID: ownerUserId,
+          OWNER_USER_ID: effectiveOwnerUserId,
           HEREYA_VERIFY_URL: `${hereyaCloudUrl}/api/auth/verify-token`,
         },
         code: lambda.Code.fromInline(`
