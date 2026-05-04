@@ -566,9 +566,22 @@ exports.handler = async (event) => {
         authorizer,
       });
 
-      // Initial-stop custom resource — fires only on create
+      // Initial-stop custom resource — also fires on update so replacement
+      // instances (e.g. when a stack update changes UserData and CFN replaces
+      // the EC2) get stopped too. Without onUpdate, a replaced instance stays
+      // running and costs money even though the broker is supposed to wake it
+      // on demand. The SDK call is idempotent — stopping an already-stopped
+      // instance is a no-op — so firing on every stack update is safe.
       const initialStop = new cr.AwsCustomResource(this, 'DevEnvInitialStop', {
         onCreate: {
+          service: 'EC2',
+          action: 'stopInstances',
+          parameters: {
+            InstanceIds: [instance.instanceId],
+          },
+          physicalResourceId: cr.PhysicalResourceId.of(`${this.stackName}-initial-stop`),
+        },
+        onUpdate: {
           service: 'EC2',
           action: 'stopInstances',
           parameters: {
