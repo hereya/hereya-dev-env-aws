@@ -3,7 +3,6 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import { HttpLambdaAuthorizer, HttpLambdaResponseType } from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
@@ -26,6 +25,7 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
     const lifecycle = process.env['lifecycle'] || 'on-demand';
     const idleStopMinutes = parseInt(process.env['idleStopMinutes'] || '30', 10);
     const connectionIdleBps = parseInt(process.env['connectionIdleBps'] || '100', 10);
+    const ownerUserId = process.env['ownerUserId'];
 
     // VPC
     const vpc = vpcId
@@ -397,54 +397,67 @@ export class HereyaDevEnvAwsStack extends cdk.Stack {
       }));
     }
 
-    // On-demand wake broker (Lambda + API Gateway + Authorizer + Token Secret)
+    // On-demand wake broker (Lambda + API Gateway + Authorizer)
     if (lifecycle === 'on-demand') {
-      // Token secret
-      const tokenSecret = new secretsmanager.Secret(this, 'DevEnvWakeToken', {
-        secretName: `/hereya/devenv/${this.stackName}/wake-token`,
-        generateSecretString: {
-          excludePunctuation: true,
-          passwordLength: 48,
-        },
-        removalPolicy: cdk.RemovalPolicy.DESTROY,
-      });
+      if (!ownerUserId) {
+        throw new Error('ownerUserId is required when lifecycle=on-demand');
+      }
 
-      // Authorizer Lambda
+      // Authorizer Lambda — verifies the caller's hereya-cloud access token
+      // against the verify-token endpoint and gates by recorded owner userId.
       const authorizerFn = new lambda.Function(this, 'DevEnvAuthorizerFn', {
         runtime: lambda.Runtime.NODEJS_22_X,
         handler: 'index.handler',
         timeout: cdk.Duration.seconds(10),
         environment: {
-          TOKEN_SECRET_ARN: tokenSecret.secretArn,
+          OWNER_USER_ID: ownerUserId,
+          HEREYA_VERIFY_URL: `${hereyaCloudUrl}/api/auth/verify-token`,
         },
         code: lambda.Code.fromInline(`
-let cachedToken;
-const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
-const sm = new SecretsManagerClient({});
-const { timingSafeEqual } = require('crypto');
+const crypto = require('crypto');
+
+let cache = new Map(); // tokenHash -> { userId, expiresAt }
+const CACHE_TTL_MS = 60_000;
 
 exports.handler = async (event) => {
   try {
-    if (!cachedToken) {
-      const r = await sm.send(new GetSecretValueCommand({ SecretId: process.env.TOKEN_SECRET_ARN }));
-      cachedToken = r.SecretString;
-    }
     const headers = event.headers || {};
-    const authHeader = headers.authorization || headers.Authorization || '';
-    const m = /^Bearer\\s+(.+)$/.exec(authHeader);
+    const auth = headers.authorization || headers.Authorization || '';
+    const m = /^Bearer\\s+(.+)$/.exec(auth);
     if (!m) return { isAuthorized: false };
-    const supplied = Buffer.from(m[1]);
-    const expected = Buffer.from(cachedToken);
-    if (supplied.length !== expected.length) return { isAuthorized: false };
-    return { isAuthorized: timingSafeEqual(supplied, expected) };
-  } catch (e) {
-    console.error('authorizer error', e);
+    const token = m[1];
+
+    const hash = crypto.createHash('sha256').update(token).digest('hex');
+    const now = Date.now();
+    let entry = cache.get(hash);
+
+    if (!entry || entry.expiresAt < now) {
+      const r = await fetch(process.env.HEREYA_VERIFY_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+      if (!r.ok) return { isAuthorized: false };
+      const body = await r.json();
+      if (!body || body.valid !== true) return { isAuthorized: false };
+      entry = { userId: body.userId, expiresAt: now + CACHE_TTL_MS };
+      cache.set(hash, entry);
+
+      // Cap cache size — drop oldest entries when over 256.
+      if (cache.size > 256) {
+        const firstKey = cache.keys().next().value;
+        if (firstKey !== undefined) cache.delete(firstKey);
+      }
+    }
+
+    return { isAuthorized: entry.userId === process.env.OWNER_USER_ID };
+  } catch (err) {
+    console.error('authorizer error', err);
     return { isAuthorized: false };
   }
 };
 `),
       });
-      tokenSecret.grantRead(authorizerFn);
 
       // Broker Lambda
       const brokerEnv: { [k: string]: string } = {
@@ -578,10 +591,6 @@ exports.handler = async (event) => {
       new cdk.CfnOutput(this, 'devEnvWakeUrl', {
         value: httpApi.apiEndpoint,
         description: 'HTTP API endpoint for the on-demand wake broker',
-      });
-      new cdk.CfnOutput(this, 'devEnvWakeToken', {
-        value: tokenSecret.secretArn,
-        description: 'Secrets Manager ARN for the wake bearer token (resolved by Hereya CLI)',
       });
     }
 
